@@ -6,48 +6,44 @@
 #include <iostream>
 #include <mutex>
 
-//#define COMPARE_TO_STD
-
-#if defined(COMPARE_TO_STD)
-#include <mutex>
-#include <queue>
-#endif
+class nonCopyableMoveable
+{
+public:
+	nonCopyableMoveable() = default;
+	virtual ~nonCopyableMoveable() = default;
+private:
+	nonCopyableMoveable(const nonCopyableMoveable&) = delete;
+	nonCopyableMoveable(const nonCopyableMoveable&&) = delete;
+	nonCopyableMoveable& operator=(const nonCopyableMoveable&) = delete;
+	nonCopyableMoveable& operator=(const nonCopyableMoveable&&) = delete;
+};
 
 /*
 	Many producers to One consumer queue
+
+	N - queue size
+	ThreadNum - max number of threads using Q
 */
 template <class T, size_t N, size_t ThreadNum>
-class m2oQueue final
+class m2oQueue : private nonCopyableMoveable
 {
 public:
 	m2oQueue() {}
 	~m2oQueue() {}
 
-#if defined(COMPARE_TO_STD)
-	std::mutex mtx;
-	std::queue<T> q;
-#endif
-
 	bool push(const T& v)
 	{
-#if defined(COMPARE_TO_STD)
-		std::lock_guard<std::mutex> l(mtx);// rm it
-		if (q.size() > N)
-			return false;
-		q.push(v);
-		return true;
-#endif
-
 		if (m_writeHead.load() - m_readHead.load() > N)
 			return false; // no place
 
-		// it's possible that queue is almost full and ThreadNum of threads entered,
+		// it's possible that queue is almost full (one place left) and ThreadNum of threads entered,
 		// it still has enough place to store all values.
 
-		uint64_t ind = m_writeHead.fetch_add(1);
+		// many threads write in paralel
+		const uint64_t ind = m_writeHead.fetch_add(1);
+		m_ringBuffer[ind % sizeofArr()] = v;
 
-		m_arr[ind % sizeofArr()] = v;
-
+		// increment tail in the right order
 		while (m_writeTail.load() != ind);
 		++m_writeTail;
 
@@ -55,73 +51,54 @@ public:
 	}
 	bool pop(T& out_v)
 	{
-#if defined(COMPARE_TO_STD)
-		std::lock_guard<std::mutex> l(mtx);// rm it
-		if (q.size() == 0)
-			return false;
-		out_v = q.front();
-		q.pop();
-		return true;
-#endif
-
 		if(m_readHead.load() == m_writeTail.load())
 			return false; // empty
 
-		out_v = m_arr[m_readHead.load() % sizeofArr()];
+		out_v = m_ringBuffer[m_readHead.load() % sizeofArr()];
 		++m_readHead;
 
 		return true;
 	}
 
 private:
-	constexpr size_t sizeofArr()const { return sizeof(m_arr) / sizeof(m_arr[0]); }
+	constexpr size_t sizeofArr()const { return sizeof(m_ringBuffer) / sizeof(m_ringBuffer[0]); }
 
 
-	T m_arr[N + ThreadNum + 1];
+	T m_ringBuffer[N + ThreadNum + 1];
 	std::atomic<uint64_t> m_writeHead{ 0 };
 	std::atomic<uint64_t> m_writeTail{ 0 };
 	std::atomic<uint64_t> m_readHead{ 0 };
 };
 
 
+
+
 /*
 	Many producers to Many consumers queue
+
+	N - queue size
+	ThreadNum - max number of threads using Q
 */
 template <class T, size_t N, size_t ThreadNum>
-class m2mQueue final
+class m2mQueue : private nonCopyableMoveable
 {
 public:
 	m2mQueue() = default;
 	~m2mQueue() = default;
 
-#if defined(COMPARE_TO_STD)
-	std::mutex mtx;
-	std::queue<T> q;
-#endif
-
 	bool push(const T& v)
 	{
-#if defined(COMPARE_TO_STD)
-		std::lock_guard<std::mutex> l(mtx);// rm it
-		if (q.size() > N)
-			return false;
-		q.push(v);
-		return true;
-#endif
-
-		if (m_readHead.load() > m_writeTail.load())
-			*(static_cast<int*>(0)) = 0;
-
 		if (m_writeHead.load() - m_readTail.load() > N)
 			return false; // no place
 
 		// it's possible that queue is almost full and ThreadNum of threads entered,
 		// it still has enough place to store all values.
 
-		uint64_t ind = m_writeHead.fetch_add(1);
+		// many threads write in paralel
+		const uint64_t ind = m_writeHead.fetch_add(1);
+		m_ringBuffer[ind % sizeofArr()] = v;
 
-		m_arr[ind % sizeofArr()] = v;
-
+		// increment tail in the right order
 		while (m_writeTail.load() != ind);
 		++m_writeTail;
 
@@ -131,20 +108,11 @@ public:
 	}
 	bool pop(T& out_v)
 	{
-#if defined(COMPARE_TO_STD)
-		std::lock_guard<std::mutex> l(mtx);// rm it
-		if (q.size() == 0)
-			return false;
-		out_v = q.front();
-		q.pop();
-		return true;
-#endif
-
 		uint64_t ind{ 0 };
 		{
 			// tried with RAII std::lock_guard and my own lock
 			// performance drops drastically 
-			m_mtx.lock();
+			m_mtx.lock(); // spin lock
 			if (m_readHead.load() < m_writeTail.load())
 			{
 				ind = m_readHead.fetch_add(1);
@@ -155,12 +123,10 @@ public:
 				m_mtx.unlock();
 				return false; // empty
 			}
-
-			if (m_readHead.load() > m_writeTail.load())
-				*(static_cast<int*>(0)) = 0;
 		}
 
-		out_v = m_arr[ind % sizeofArr()];
+		// many threads read in paralel
+		out_v = m_ringBuffer[ind % sizeofArr()];
 
 		while (m_readTail.load() != ind);
 		++m_readTail;
@@ -171,7 +137,7 @@ public:
 	}
 
 private:
-	constexpr size_t sizeofArr()const { return sizeof(m_arr) / sizeof(m_arr[0]); }
+	constexpr size_t sizeofArr()const { return sizeof(m_ringBuffer) / sizeof(m_ringBuffer[0]); }
 
 	void printState()
 	{
@@ -186,7 +152,7 @@ private:
 			<< std::endl;
 	}
 
-	T m_arr[N + ThreadNum + 1];
+	T m_ringBuffer[N + ThreadNum + 1];
 	std::atomic<uint64_t> m_writeHead{ 0 };
 	std::atomic<uint64_t> m_writeTail{ 0 };
 	std::atomic<uint64_t> m_readHead{ 0 };
